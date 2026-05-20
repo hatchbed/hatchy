@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.1]
+
+### Changed
+ - Improved output formatting.
+
 ## [0.5.0]
 
 ### Added
