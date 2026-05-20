@@ -79,6 +79,16 @@ _CTEST_BOILERPLATE = (
     '--rerun-failed --output-on-failure',
 )
 
+# Colcon WARNING lines that are harmless noise (e.g. stale prefix paths after a
+# clean).  Matched as substrings so the surrounding module path doesn't matter.
+_SUPPRESSED_WARNINGS = (
+    "in the environment variable CMAKE_PREFIX_PATH doesn't exist",
+    "in the environment variable AMENT_PREFIX_PATH doesn't exist",
+)
+
+# Colcon prefixes logger output (WARNING/INFO/etc.) with a wall-clock timestamp.
+_COLCON_TS_RE = re.compile(r'^\[\d+(?:\.\d+)?s\]\s+')
+
 # Lines that mark a colcon-level boundary outside any per-package output.  Used
 # to confirm a deferred stderr-block close (bare `---`) is really a delimiter
 # rather than incidental content.
@@ -93,7 +103,7 @@ def _is_ctest_boilerplate(line: str) -> bool:
 
 
 def _is_colcon_boundary(line: str) -> bool:
-    return bool(_COLCON_BOUNDARY_RE.match(line))
+    return bool(_COLCON_BOUNDARY_RE.match(_COLCON_TS_RE.sub('', line, count=1)))
 
 
 def _read_tail(path: str, nbytes: int = _TAIL_READ_BYTES) -> str:
@@ -141,6 +151,156 @@ _GTEST_RUN_RE = re.compile(r'^(\d+):\s*\[\s*RUN\s*\]\s+(.+)$')
 _GTEST_END_RE = re.compile(r'^(\d+):\s*\[\s*(?:OK|FAILED)\s*\]')
 _PYUNIT_START_RE = re.compile(r'^(\d+):\s+(\w+)\s+\([^)]+\)\s+\.\.\.')
 _PYUNIT_END_RE = re.compile(r'^(\d+):\s+(?:ok|FAIL(?:ED)?|ERROR|Ran\s+\d+)')
+
+# ExternalProject step-name tables used by _format_ninja_desc.
+_EP_STEPS: Dict[str, str] = {
+    'gitclone': 'clone', 'gitupdate': 'update',
+    'mkdirs': 'mkdir',   'mkdir': 'mkdir',
+    'patch': 'patch',    'configure': 'configure',
+    'build': 'build',    'install': 'install',
+    'download': 'download', 'test': 'test',
+    'update': 'update',  'clone': 'clone',
+}
+_EP_STEP_PAT = '|'.join(_EP_STEPS)
+_EP_SCRIPT_RE = re.compile(r'^(.+?)-(' + _EP_STEP_PAT + r')\.cmake$')
+_EP_STAMP_RE = re.compile(r'^(.+?)-(' + _EP_STEP_PAT + r')$')
+
+
+def _format_make_desc(desc: str) -> str:
+    """Simplify a CMake/Make progress description to a compact label."""
+    # Building (C|CXX) object <path>/<file.ext>.o  →  Compiling <file.ext>
+    m = re.match(r'^Building (?:C|CXX) object .*/([^/]+\.[a-zA-Z]+)\.o$', desc)
+    if m:
+        return f"Compiling {m.group(1)}"
+    # Linking (C|CXX) (executable|shared library|...) <path>  →  Linking <basename>
+    m = re.match(r'^Linking (?:C|CXX) (?:executable|shared library|static library|shared module) (.+)$', desc)
+    if m:
+        return f"Linking {os.path.basename(m.group(1))}"
+    # Performing <step> step [(<detail>)] for '<name>'  →  <name>: <step>
+    m = re.match(r"^Performing (\S+) step.*? for '(.+)'$", desc)
+    if m:
+        step = m.group(1)
+        if step == 'download':
+            step = 'clone'
+        return f"{m.group(2)}: {step}"
+    return desc
+
+
+def _format_ninja_desc(desc: str) -> str:
+    """Simplify a verbose ninja step command to a compact human-readable label.
+
+    Handles the compound ``cd dir && cmd1 && cmd2`` forms produced by
+    ``ninja -v``, ExternalProject cmake ``-P`` scripts, cmake configure/build
+    steps, compiler ``-c`` invocations, and linker ``-o`` invocations.
+    """
+    # Strip leading/trailing ninja link-step markers (`: && ... && :`)
+    desc = re.sub(r'^:\s*[;&]+\s*', '', desc).strip()
+    desc = re.sub(r'\s*&&\s*:\s*$', '', desc).strip()
+
+    # Peel off `cd <dir> && `, keeping the dir as context for `--build .`
+    cd_dir: Optional[str] = None
+    m = re.match(r'^cd\s+(\S+)\s*&&\s*(.*)', desc, re.DOTALL)
+    if m:
+        cd_dir = m.group(1)
+        desc = m.group(2).strip()
+
+    # Walk each `&&`-chained command.  cmake -E stamp/utility calls are skipped
+    # but the last stamp path is remembered as a fallback label.
+    stamp_fallback: Optional[str] = None
+    for cmd in re.split(r'\s*&&\s*', desc):
+        cmd = cmd.strip()
+        if not cmd or re.match(r'^:$|^true$', cmd):
+            continue
+
+        # cmake -E touch <stamp> — skip but capture as fallback
+        m = re.match(r'.*cmake\s+-E\s+touch\s+(\S+)', cmd)
+        if m:
+            sm = _EP_STAMP_RE.match(os.path.basename(m.group(1)))
+            if sm and stamp_fallback is None:
+                stamp_fallback = f"{sm.group(1)}: {_EP_STEPS.get(sm.group(2), sm.group(2))}"
+            continue
+
+        # cmake -E copy/copy_directory/copy_if_different <src> <dest>  →  primary action
+        m = re.match(r'.*cmake\s+-E\s+copy(?:_directory|_if_different)?\s+\S+\s+(\S+)', cmd)
+        if m:
+            return f"cmake copy: {os.path.basename(m.group(1))}"
+
+        # Other cmake -E utilities (rm, make_directory, echo_append, …) — skip
+        if re.search(r'\bcmake\s+-E\b', cmd):
+            continue
+
+        # cmake -P <script>  →  ExternalProject named step
+        m = re.search(r'\bcmake\s+(?:-\S+\s+)*-P\s+(\S+)', cmd)
+        if m:
+            sm = _EP_SCRIPT_RE.match(os.path.basename(m.group(1)))
+            if sm:
+                return f"{sm.group(1)}: {_EP_STEPS.get(sm.group(2), sm.group(2))}"
+            return f"cmake script: {os.path.basename(m.group(1))}"
+
+        # cmake --build <dir>  →  "cmake build: <name>"
+        m = re.search(r'\bcmake\s+--build\s+(\S+)', cmd)
+        if m:
+            d = m.group(1)
+            if d == '.' and cd_dir:
+                d = cd_dir
+            name = os.path.basename(d)
+            if name.endswith('-build'):
+                name = name[:-6]
+            return f"cmake build: {name}"
+
+        # cmake configure  (-S <src> -B <build>)  →  "cmake configure: <name>"
+        ms = re.search(r'(?:^|\s)-S\s+(\S+)', cmd)
+        if ms and re.search(r'(?:^|\s)-B\s+', cmd):
+            return f"cmake configure: {os.path.basename(ms.group(1))}"
+
+        # Static archiver: ar qc/rcs/cr/rc <target.a> ...
+        m = re.search(r'\bar\s+\w*[qrc]\w*\s+(\S+)', cmd)
+        if m:
+            return f"Archiving {os.path.basename(m.group(1))}"
+
+        # For tool-based patterns, work from the command's executable basename.
+        cmd_parts = cmd.split()
+        exe_base = os.path.basename(cmd_parts[0]) if cmd_parts else ''
+
+        # xacro: use -o output if present, otherwise the first .xacro input
+        if exe_base == 'xacro':
+            m = re.search(r'(?:^|\s)-o\s+(\S+)', cmd)
+            if m:
+                return f"xacro: {os.path.basename(m.group(1))}"
+            m = re.search(r'(\S+\.xacro(?:\.\w+)?)', cmd)
+            if m:
+                return f"xacro: {os.path.basename(m.group(1))}"
+            return "xacro"
+
+        # Python3 interpreter: python3 <script> [args]
+        if exe_base in ('python', 'python2', 'python3'):
+            script = os.path.basename(cmd_parts[1]) if len(cmd_parts) > 1 else 'python'
+            return f"Running {script}"
+
+        # Direct Python script invocation: <script>.py [args]
+        if exe_base.endswith('.py'):
+            mo = re.search(r'(?:^|\s)(?:-o|--output)\s+(\S+)', cmd)
+            if mo:
+                return f"Running {exe_base}: {os.path.basename(mo.group(1))}"
+            last_file = next(
+                (os.path.basename(p) for p in reversed(cmd_parts[1:])
+                 if not p.startswith('-') and '.' in p),
+                None)
+            if last_file:
+                return f"Running {exe_base}: {last_file}"
+            return f"Running {exe_base}"
+
+        # Compile step: -c <source>
+        m = re.search(r'(?:^|\s)-c\s+(\S+)', cmd)
+        if m:
+            return f"Compiling {os.path.basename(m.group(1))}"
+
+        # Link step: -o <target>
+        m = re.search(r'(?:^|\s)-o\s+(\S+)', cmd)
+        if m:
+            return f"Linking {os.path.basename(m.group(1))}"
+
+    return stamp_fallback or desc
 
 
 def _parse_test_progress(log_path: Optional[str]) -> Optional[Tuple[int, str]]:
@@ -212,6 +372,34 @@ def _parse_test_progress(log_path: Optional[str]) -> Optional[Tuple[int, str]]:
     return pct, desc
 
 
+def _extract_build_errors(log_path: str) -> List[str]:
+    """Return error-relevant lines from a build stdout.log.
+
+    Filters out the verbose compiler invocation lines (long lines full of -D/-I
+    flags) while keeping diagnostics, context lines, and terminal error markers.
+    Returns an empty list when no error signal is found.
+    """
+    try:
+        tail = _strip_ansi(_read_tail(log_path))
+    except OSError:
+        return []
+    result = []
+    for line in tail.splitlines():
+        # Drop ninja/make progress step lines — not useful in error context.
+        if re.match(r'^\s*\[\d+[/%]', line):
+            continue
+        # Drop long compiler invocation lines (compiler path + -D/-I flags).
+        if len(line) > 200 and re.search(r'\s+-[DI]\S', line):
+            continue
+        result.append(line)
+    # Only return content if there is at least one error/failure indicator.
+    _ERROR_RE = re.compile(
+        r':\s*(?:error|fatal error):|ninja: build stopped|make.*\*\*\*|^FAILED:', re.IGNORECASE)
+    if any(_ERROR_RE.search(ln) for ln in result):
+        return result
+    return []
+
+
 def _parse_progress(log_path: Optional[str]) -> Optional[Tuple[int, str]]:
     """Return (percent, description) from the most recent build progress line."""
     if not log_path:
@@ -222,18 +410,13 @@ def _parse_progress(log_path: Optional[str]) -> Optional[Tuple[int, str]]:
         # cmake/make: [67%] Building CXX object src/foo.cc.o
         m = re.match(r'^\[\s*(\d+)%\]\s+(.*)', line)
         if m:
-            return int(m.group(1)), m.group(2).strip()
+            return int(m.group(1)), _format_make_desc(m.group(2).strip())
         # ninja: [67/100] ...
         m = re.match(r'^\[(\d+)/(\d+)\]\s+(.*)', line)
         if m:
             a, b = int(m.group(1)), int(m.group(2))
             pct = int(100 * a / b) if b else 0
-            desc = m.group(3).strip()
-            # With VERBOSE=1, ninja shows full compiler commands; extract source file.
-            src = re.search(r'(?:^|\s)-c\s+(\S+)', desc)
-            if src:
-                desc = f"Compiling {os.path.basename(src.group(1))}"
-            return pct, desc
+            return pct, _format_ninja_desc(m.group(3).strip())
     return None
 
 
@@ -548,9 +731,13 @@ class StatusDisplay:
                 self._append_stderr_line(line)
             return
 
-        # Warning lines from colcon/CMake — color yellow
-        if line.startswith('WARNING:'):
-            self._scroll_print(clr(line, _YELLOW))
+        # Warning lines from colcon/CMake — color yellow, suppress known noise.
+        # Colcon prefixes logger lines with a wall-clock timestamp; strip it
+        # before matching so both "[0.3s] WARNING:..." and "WARNING:..." work.
+        bare = _COLCON_TS_RE.sub('', line, count=1)
+        if bare.startswith('WARNING:'):
+            if not any(s in bare for s in _SUPPRESSED_WARNINGS):
+                self._scroll_print(clr(bare, _YELLOW))
             return
 
         # Unknown lines — pass through for forward compatibility
@@ -830,6 +1017,17 @@ class StatusDisplay:
                 for ln in highlight_stderr(state.stderr):
                     print(f"  {ln}")
                 print(clr('---', color))
+
+        # For failed packages that produced no colcon stderr block, fall back to
+        # stdout.log — build tool errors (compiler, linker) go there, not stderr.
+        for state in self._done:
+            if not state.ok and not state.has_stderr and state.log_path:
+                lines = _extract_build_errors(state.log_path)
+                if lines:
+                    print(f"\n{clr(f'--- stdout: {state.name} ---', _RED)}")
+                    for ln in highlight_stderr(lines):
+                        print(f"  {ln}")
+                    print(clr('---', _RED))
 
         if not self._show_build_summary:
             return

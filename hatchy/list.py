@@ -1,8 +1,9 @@
 import os
+import shutil
 import subprocess
 import sys
 
-from .common import get_workspace_dir, parse_package_name, clr, _CYAN, _DIM, _BRIGHT_MAGENTA
+from .common import get_workspace_dir, parse_package_name, clr, _CYAN, _DIM, _BRIGHT_BLUE, _BRIGHT_MAGENTA
 
 
 def register(subparsers):
@@ -105,13 +106,15 @@ def list_packages_command(args):
 
     name_w = max(max(len(name) for name, _ in packages), len("name"))
     path_w = max(max(len(p) for _, p in packages), len("path"))
-    sep = clr("-" * (name_w + 2 + path_w), _BRIGHT_MAGENTA)
+    ansi_w = len(clr('', _CYAN))
+    term_w = shutil.get_terminal_size().columns
+    sep = clr("─" * min(name_w + 2 + path_w, term_w), _BRIGHT_MAGENTA)
 
     print(sep)
     print(f"{_col('name', name_w)}  {clr('path', _CYAN)}")
     print(sep)
     for name, rel_path in packages:
-        print(f"{name:<{name_w}}  {clr(rel_path, _DIM)}")
+        print(f"{clr(name, _BRIGHT_BLUE):<{name_w + ansi_w}}  {clr(rel_path, _DIM)}")
     print(sep)
 
 
@@ -126,13 +129,15 @@ def list_repos_command(args):
     type_w = max(max(len(r["type"]) for r in repos), len("type"))
     url_w = max(max(len(r.get("url", "")) for r in repos), len("url"))
     ver_w = max(max(len(r.get("version", "")) for r in repos), len("version"))
-    sep = clr("-" * (path_w + 2 + type_w + 2 + url_w + 2 + ver_w), _BRIGHT_MAGENTA)
+    ansi_w = len(clr('', _CYAN))
+    term_w = shutil.get_terminal_size().columns
+    sep = clr("─" * min(path_w + 2 + type_w + 2 + url_w + 2 + ver_w, term_w), _BRIGHT_MAGENTA)
 
     print(sep)
     print(f"{_col('path', path_w)}  {_col('type', type_w)}  {_col('url', url_w)}  {clr('version', _CYAN)}")
     print(sep)
     for repo in repos:
-        path_col = clr(repo['path'], _CYAN) + ' ' * (path_w - len(repo['path']))
+        path_col = clr(repo['path'], _BRIGHT_BLUE) + ' ' * (path_w - len(repo['path']))
         type_col = f"{repo['type']:<{type_w}}"
         url = repo.get('url', '')
         url_col = clr(url, _DIM) + ' ' * (url_w - len(url))

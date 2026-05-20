@@ -1,5 +1,6 @@
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -138,7 +139,7 @@ def print_test_results(workspace, build_space, verbose=False, packages=None, ela
     total_tests = total_passed = total_skipped = total_failed = 0
     any_failure = False
 
-    sep = clr("-" * 70, _BRIGHT_MAGENTA)
+    sep = clr("─" * min(70, shutil.get_terminal_size().columns), _BRIGHT_MAGENTA)
     print()
     print(sep)
 

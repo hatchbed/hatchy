@@ -196,6 +196,18 @@ _STATUS_TAG_W = len("[missing] ")
 _GENERATOR_DISPLAY = {'Ninja': 'ninja', 'Unix Makefiles': 'make'}
 
 
+def _tool_exists(tool_type: str, val: str) -> bool:
+    if tool_type == 'generator':
+        return shutil.which(val) is not None
+    elif tool_type == 'linker':
+        return (shutil.which(f'ld.{val}') is not None
+                or shutil.which(val) is not None)
+    else:  # compiler, ccache
+        if os.path.isabs(val):
+            return os.path.isfile(val)
+        return shutil.which(val) is not None
+
+
 def parse_cmake_settings(colcon_build_args):
     tokens = []
     for arg in colcon_build_args or []:
@@ -292,7 +304,8 @@ def print_workspace_state(workspace):
     test_results_dir = os.path.join(workspace, test_result_space)
     env_extend_path = os.environ.get("COLCON_PREFIX_PATH", None)
 
-    sep = clr("-" * 70, _BRIGHT_MAGENTA)
+    term_w = shutil.get_terminal_size().columns
+    sep = clr("─" * min(70, term_w), _BRIGHT_MAGENTA)
 
     # Status-section keys are padded so their status tags ("[exists]" /
     # "[missing]") start at the same column; plain-section keys are padded so
@@ -339,6 +352,18 @@ def print_workspace_state(workspace):
             return f"{clr(tag, _DIM)}{gap}{default}"
         return ' ' * _STATUS_TAG_W + val
 
+    def _tool_status(val, tool_type):
+        if val is None:
+            tag = '[default]'
+            gap = ' ' * (_STATUS_TAG_W - len(tag))
+            return f"{clr(tag, _DIM)}{gap}"
+        if _tool_exists(tool_type, val):
+            label, color = '[exists]', _GREEN
+        else:
+            label, color = '[missing]', _YELLOW
+        gap = ' ' * (_STATUS_TAG_W - len(label))
+        return f"{clr(label, color)}{gap}{val}"
+
     print(sep)
     print(f"{_key_pad('CPU Niceness:', value_col)}{nice}")
     if not colcon_build_args:
@@ -347,11 +372,11 @@ def print_workspace_state(workspace):
         print(f"{_key_pad('Colcon Build Args:', value_col)}{colcon_build_args[0]}")
         for arg in colcon_build_args[1:]:
             print(f"{' ' * value_col}{arg}")
-    print(f"{_key_pad('Generator:', key_w)}{_cmake_status(cmake['generator'])}")
+    print(f"{_key_pad('Generator:', key_w)}{_tool_status(cmake['generator'], 'generator')}")
     print(f"{_key_pad('Build Type:', key_w)}{_cmake_status(cmake['build_type'])}")
-    print(f"{_key_pad('Compiler:', key_w)}{_cmake_status(cmake['compiler'])}")
-    print(f"{_key_pad('Linker:', key_w)}{_cmake_status(cmake['linker'])}")
-    print(f"{_key_pad('Compiler Cache:', key_w)}{_cmake_status(cmake['ccache'])}")
+    print(f"{_key_pad('Compiler:', key_w)}{_tool_status(cmake['compiler'], 'compiler')}")
+    print(f"{_key_pad('Linker:', key_w)}{_tool_status(cmake['linker'], 'linker')}")
+    print(f"{_key_pad('Compiler Cache:', key_w)}{_tool_status(cmake['ccache'], 'ccache')}")
     print(f"{_key_pad('Build Testing:', key_w)}{_cmake_status(cmake['build_testing'], 'on')}")
     print(f"{_key_pad('Compile Commands:', key_w)}{_cmake_status(cmake['compile_commands'], 'off')}")
     print(sep)
