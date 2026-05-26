@@ -39,12 +39,14 @@ def register(subparsers):
 
 
 def get_xunit_path_from_cmdline(cmdline):
-    """Extract the xunit result file path from a run_test.py FullCommandLine."""
+    """Extract the xunit result file path from a run_test.py or --gtest_output FullCommandLine."""
     try:
         tokens = shlex.split(cmdline)
         for i, token in enumerate(tokens):
             if 'run_test.py' in token and i + 1 < len(tokens):
                 return tokens[i + 1]
+            if token.startswith('--gtest_output=xml:'):
+                return token[len('--gtest_output=xml:'):]
     except Exception:
         pass
     return None
