@@ -1,6 +1,6 @@
 # Changelog
 
-## [Upcoming]
+## [0.5.2]
 
 ### Fixed
 - Fixed test parsing to extract the xunit result file path from a run_test.py or --gtest_output flag.
