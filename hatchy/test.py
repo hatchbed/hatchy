@@ -7,6 +7,8 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 
+import yaml
+
 from .common import (get_workspace_dir, get_package,
                      clr, supports_ansi, _fmt_duration, _strip_ansi,
                      _GREEN, _YELLOW, _RED, _BOLD_RED,
@@ -27,7 +29,8 @@ def register(subparsers):
     packages_group.add_argument(
         "--no-deps", action="store_true",
         help="Only test specified packages, not their dependencies.")
-    config_group = parser.add_argument_group('Config', "Parameters for the underlying build system.")
+    config_group = parser.add_argument_group(
+        'Config', "Parameters for the underlying build system.")
     config_group.add_argument(
         "--colcon-build-args", metavar='ARG', dest='colcon_build_args',
         nargs="+", required=False, type=str, default=None,
@@ -96,7 +99,7 @@ def parse_xunit_results(xunit_path):
 
         passed = total - failures - errors - skipped
         return total, passed, skipped, failures, errors, failed_names, all_cases
-    except Exception:
+    except Exception:  # missing file, malformed XML, or unexpected schema
         return None
 
 
@@ -140,6 +143,168 @@ def get_latest_ctest_xml(pkg_build_dir):
     return xml_path if os.path.isfile(xml_path) else None
 
 
+def _print_diff_detail(detail: str, indent: str) -> None:
+    """Print a diff/failure detail block with syntax coloring."""
+    for line in detail.splitlines():
+        if line.startswith('+') and not line.startswith('+++'):
+            color = _GREEN
+        elif line.startswith('-') and not line.startswith('---'):
+            color = _RED
+        elif line.startswith('@@') or line.startswith('---') or line.startswith('+++'):
+            color = _BRIGHT_BLUE
+        else:
+            color = None
+        print(f"{indent}{clr(line, color) if color else line}")
+
+
+def _build_counts_str(xunit, cpplint_result, suite_ok):
+    """Build the colored counts string for one suite. Returns (counts_str, visible_len)."""
+    if xunit:
+        _, n_passed, n_skipped, n_failures, n_errors, _, _ = xunit
+        counts = []
+        if n_passed:
+            counts.append(clr(f"{n_passed} passed", _GREEN))
+        if n_skipped:
+            counts.append(clr(f"{n_skipped} skipped", _YELLOW))
+        if n_failures:
+            counts.append(clr(f"{n_failures} failed", _BOLD_RED))
+        if n_errors:
+            counts.append(clr(f"{n_errors} errors", _BOLD_RED))
+        counts_str = ", ".join(counts) if counts else "0 tests"
+    elif cpplint_result:
+        _, n_passed_cp, n_failed_cp, _ = cpplint_result
+        counts = []
+        if n_passed_cp:
+            counts.append(clr(f"{n_passed_cp} passed", _GREEN))
+        if n_failed_cp:
+            counts.append(clr(f"{n_failed_cp} failed", _BOLD_RED))
+        counts_str = ", ".join(counts) if counts else "0 files"
+    else:
+        counts_str = clr("passed", _GREEN) if suite_ok else clr("FAILED", _BOLD_RED)
+    return counts_str, len(_strip_ansi(counts_str))
+
+
+def _collect_pkg_suites(build_dir, pkg):
+    """Parse CTest XML for one package.
+
+    Returns (suite_data, stats) or None if no results exist.
+    suite_data is a list of (name, label, exec_time, xunit, suite_ok, cpplint_result).
+    stats is a dict with keys: n_suites, suites_passed, tests, passed, skipped,
+    failed_tests, any_failed.
+    """
+    ctest_xml = get_latest_ctest_xml(os.path.join(build_dir, pkg))
+    if ctest_xml is None:
+        return None
+    try:
+        root = ET.parse(ctest_xml).getroot()
+    except Exception:  # missing file or malformed XML
+        return None
+
+    test_entries = root.findall('.//Testing/Test')
+    if not test_entries:
+        return None
+
+    suite_data = []
+    pkg_tests = pkg_passed = pkg_skipped = pkg_failed_tests = pkg_suites_passed = 0
+    pkg_failed = False
+
+    for entry in test_entries:
+        name = entry.findtext('Name', '')
+        cmdline = entry.findtext('FullCommandLine', '')
+        suite_ok = entry.get('Status') == 'passed'
+
+        exec_time = None
+        for nm in entry.findall('.//NamedMeasurement'):
+            if nm.get('name') == 'Execution Time':
+                try:
+                    exec_time = float(nm.findtext('Value', '0'))
+                except ValueError:
+                    pass
+
+        labels = [lbl.text for lbl in entry.findall('.//Label') if lbl.text]
+        label = labels[0] if labels else ''
+
+        xunit_path = get_xunit_path_from_cmdline(cmdline)
+        xunit = None
+        if xunit_path and os.path.isfile(xunit_path):
+            xunit = parse_xunit_results(xunit_path)
+
+        if xunit:
+            n_total, n_passed, n_skipped, n_failures, n_errors, _, _ = xunit
+            pkg_tests += n_total
+            pkg_passed += n_passed
+            pkg_skipped += n_skipped
+            pkg_failed_tests += n_failures + n_errors
+            if n_failures or n_errors:
+                suite_ok = False
+            if not label and '--gtest_output' in cmdline:
+                label = 'gtest'
+
+        if suite_ok:
+            pkg_suites_passed += 1
+        else:
+            pkg_failed = True
+
+        cpplint_result = None
+        if not xunit and 'cpplint' in cmdline.lower():
+            if not label:
+                label = 'cpplint'
+            cpplint_result = parse_cpplint_output(entry.findtext('.//Measurement/Value', ''))
+            if cpplint_result:
+                n_total, n_passed_cp, n_failed_cp, _ = cpplint_result
+                pkg_tests += n_total
+                pkg_passed += n_passed_cp
+                pkg_failed_tests += n_failed_cp
+
+        suite_data.append((name, label, exec_time, xunit, suite_ok, cpplint_result))
+
+    stats = {
+        'n_suites': len(test_entries),
+        'suites_passed': pkg_suites_passed,
+        'tests': pkg_tests,
+        'passed': pkg_passed,
+        'skipped': pkg_skipped,
+        'failed_tests': pkg_failed_tests,
+        'any_failed': pkg_failed,
+    }
+    return suite_data, stats
+
+
+def _print_suite_entry(name, label, exec_time, xunit, suite_ok, cpplint_result,
+                       name_w, label_w, counts_str, padding, verbose):
+    """Print one suite's result line and optional per-test details."""
+    tag = clr("[ ok ]", _GREEN) if suite_ok else clr("[FAIL]", _BOLD_RED)
+    label_str = f" [{label}]" if label else ""
+    time_str = (f"  ({clr(f'{exec_time:.2f}s', _BRIGHT_BLUE)})"
+                if exec_time is not None else "")
+
+    print(f"  {tag} {name:<{name_w}}{label_str:<{label_w}}  "
+          f"{counts_str}{padding}{time_str}")
+
+    if xunit:
+        _, _, _, _, _, failed_names, all_cases = xunit
+        if verbose:
+            for tc_name, tc_status, detail in all_cases:
+                tc_tag = (clr("[ ok ]", _GREEN) if tc_status == 'passed' else
+                          clr("[skip]", _YELLOW) if tc_status == 'skipped' else
+                          clr("[FAIL]", _BOLD_RED))
+                print(f"       {tc_tag} {tc_name}")
+                if detail and tc_status in ('failed', 'error'):
+                    _print_diff_detail(detail, "              ")
+        elif failed_names:
+            for tc_name, tc_status, detail in all_cases:
+                if tc_status not in ('failed', 'error'):
+                    continue
+                print(f"         FAILED: {tc_name}")
+                if detail:
+                    _print_diff_detail(detail, "                ")
+    elif cpplint_result:
+        _, _, n_failed_cp, error_lines = cpplint_result
+        if n_failed_cp:
+            for err_line in error_lines:
+                print(f"         {clr(err_line, _RED)}")
+
+
 def print_test_results(workspace, build_space, verbose=False, packages=None, elapsed=None):
     """Parse CTest XML files and print a nested test result summary.
 
@@ -151,19 +316,15 @@ def print_test_results(workspace, build_space, verbose=False, packages=None, ela
         print("No build directory found, no test results to show.")
         return 1
 
-    all_pkgs = sorted([
+    pkg_list = sorted([
         d for d in os.listdir(build_dir)
         if os.path.isdir(os.path.join(build_dir, d, 'Testing'))
     ])
-
     if packages:
-        all_pkgs = [p for p in all_pkgs if p in packages]
-
-    if not all_pkgs:
+        pkg_list = [p for p in pkg_list if p in packages]
+    if not pkg_list:
         print("No test results found.")
         return 0
-
-    packages = all_pkgs
 
     total_suites = total_suites_passed = 0
     total_tests = total_passed = total_skipped = total_failed = 0
@@ -173,187 +334,54 @@ def print_test_results(workspace, build_space, verbose=False, packages=None, ela
     print()
     print(sep)
 
-    for pkg in packages:
-        ctest_xml = get_latest_ctest_xml(os.path.join(build_dir, pkg))
-        if ctest_xml is None:
+    for pkg in pkg_list:
+        result = _collect_pkg_suites(build_dir, pkg)
+        if result is None:
             continue
-        try:
-            root = ET.parse(ctest_xml).getroot()
-        except Exception:
-            continue
+        suite_data, stats = result
 
-        test_entries = root.findall('.//Testing/Test')
-        if not test_entries:
-            continue
-
-        suite_data = []
-        pkg_tests = pkg_passed = pkg_skipped = pkg_failed_tests = pkg_suites_passed = 0
-        pkg_failed = False
-
-        for entry in test_entries:
-            name = entry.findtext('Name', '')
-            suite_ok = entry.get('Status') == 'passed'
-
-            exec_time = None
-            for nm in entry.findall('.//NamedMeasurement'):
-                if nm.get('name') == 'Execution Time':
-                    try:
-                        exec_time = float(nm.findtext('Value', '0'))
-                    except ValueError:
-                        pass
-
-            labels = [lbl.text for lbl in entry.findall('.//Label') if lbl.text]
-            label = labels[0] if labels else ''
-
-            xunit_path = get_xunit_path_from_cmdline(entry.findtext('FullCommandLine', ''))
-            xunit = None
-            if xunit_path and os.path.isfile(xunit_path):
-                xunit = parse_xunit_results(xunit_path)
-
-            if xunit:
-                n_total, n_passed, n_skipped, n_failures, n_errors, _, _ = xunit
-                pkg_tests += n_total
-                pkg_passed += n_passed
-                pkg_skipped += n_skipped
-                pkg_failed_tests += n_failures + n_errors
-                if n_failures or n_errors:
-                    suite_ok = False
-                if not label and '--gtest_output' in entry.findtext('FullCommandLine', ''):
-                    label = 'gtest'
-
-            if suite_ok:
-                pkg_suites_passed += 1
-            else:
-                pkg_failed = True
-
-            cpplint_result = None
-            if not xunit and 'cpplint' in entry.findtext('FullCommandLine', '').lower():
-                if not label:
-                    label = 'cpplint'
-                cpplint_result = parse_cpplint_output(entry.findtext('.//Measurement/Value', ''))
-                if cpplint_result:
-                    n_total, n_passed_cp, n_failed_cp, _error_lines = cpplint_result
-                    pkg_tests += n_total
-                    pkg_passed += n_passed_cp
-                    pkg_failed_tests += n_failed_cp
-
-            suite_data.append((name, label, exec_time, xunit, suite_ok, cpplint_result))
-
-        if pkg_failed:
+        if stats['any_failed']:
             any_failure = True
-        n_suites = len(test_entries)
-        total_suites += n_suites
-        total_suites_passed += pkg_suites_passed
-        total_tests += pkg_tests
-        total_passed += pkg_passed
-        total_skipped += pkg_skipped
-        total_failed += pkg_failed_tests
+        total_suites += stats['n_suites']
+        total_suites_passed += stats['suites_passed']
+        total_tests += stats['tests']
+        total_passed += stats['passed']
+        total_skipped += stats['skipped']
+        total_failed += stats['failed_tests']
 
-        if pkg_tests > 0:
-            parts = [clr(f"{pkg_passed} passed", _GREEN)]
-            if pkg_skipped:
-                parts.append(clr(f"{pkg_skipped} skipped", _YELLOW))
-            if pkg_failed_tests:
-                parts.append(clr(f"{pkg_failed_tests} failed", _BOLD_RED))
-            print(f"{pkg}: {pkg_suites_passed}/{n_suites} suites passed  ({', '.join(parts)})")
+        if stats['tests'] > 0:
+            parts = [clr(f"{stats['passed']} passed", _GREEN)]
+            if stats['skipped']:
+                parts.append(clr(f"{stats['skipped']} skipped", _YELLOW))
+            if stats['failed_tests']:
+                parts.append(clr(f"{stats['failed_tests']} failed", _BOLD_RED))
+            print(f"{pkg}: {stats['suites_passed']}/{stats['n_suites']} suites passed"
+                  f"  ({', '.join(parts)})")
         else:
-            print(f"{pkg}: {pkg_suites_passed}/{n_suites} suites passed")
+            print(f"{pkg}: {stats['suites_passed']}/{stats['n_suites']} suites passed")
 
         name_w = max(len(s[0]) for s in suite_data)
         label_w = max((len(f" [{s[1]}]") if s[1] else 0) for s in suite_data)
 
-        suite_counts = []
-        for name, label, exec_time, xunit, suite_ok, cpplint_result in suite_data:
-            if xunit:
-                n_total, n_passed, n_skipped, n_failures, n_errors, failed_names, all_cases = xunit
-                counts = []
-                if n_passed:
-                    counts.append(clr(f"{n_passed} passed", _GREEN))
-                if n_skipped:
-                    counts.append(clr(f"{n_skipped} skipped", _YELLOW))
-                if n_failures:
-                    counts.append(clr(f"{n_failures} failed", _BOLD_RED))
-                if n_errors:
-                    counts.append(clr(f"{n_errors} errors", _BOLD_RED))
-                counts_str = ", ".join(counts) if counts else "0 tests"
-            elif cpplint_result:
-                n_total, n_passed_cp, n_failed_cp, _error_lines = cpplint_result
-                counts = []
-                if n_passed_cp:
-                    counts.append(clr(f"{n_passed_cp} passed", _GREEN))
-                if n_failed_cp:
-                    counts.append(clr(f"{n_failed_cp} failed", _BOLD_RED))
-                counts_str = ", ".join(counts) if counts else "0 files"
-            else:
-                counts_str = clr("passed", _GREEN) if suite_ok else clr("FAILED", _BOLD_RED)
-            counts_vis = len(_strip_ansi(counts_str))
-            suite_counts.append((xunit, counts_str, counts_vis))
-
-        counts_w = max(cv for _, _, cv in suite_counts)
+        suite_counts = [
+            _build_counts_str(xunit, cpplint_result, suite_ok)
+            for _, _, _, xunit, suite_ok, cpplint_result in suite_data
+        ]
+        counts_w = max(vis for _, vis in suite_counts)
 
         for (name, label, exec_time, xunit, suite_ok, cpplint_result), \
-                (xunit2, counts_str, counts_vis) in zip(suite_data, suite_counts):
-            tag = clr("[ ok ]", _GREEN) if suite_ok else clr("[FAIL]", _BOLD_RED)
-            label_str = f" [{label}]" if label else ""
-            time_str = f"  ({clr(f'{exec_time:.2f}s', _BRIGHT_BLUE)})" if exec_time is not None else ""
+                (counts_str, counts_vis) in zip(suite_data, suite_counts):
             padding = " " * (counts_w - counts_vis)
-
-            if xunit:
-                n_total, n_passed, n_skipped, n_failures, n_errors, failed_names, all_cases = xunit
-                print(f"  {tag} {name:<{name_w}}{label_str:<{label_w}}  "
-                      f"{counts_str}{padding}{time_str}")
-                if verbose:
-                    for tc_name, tc_status, detail in all_cases:
-                        tc_tag = clr("[ ok ]", _GREEN) if tc_status == 'passed' else \
-                                 clr("[skip]", _YELLOW) if tc_status == 'skipped' else \
-                                 clr("[FAIL]", _BOLD_RED)
-                        print(f"       {tc_tag} {tc_name}")
-                        if detail and tc_status in ('failed', 'error'):
-                            for line in detail.splitlines():
-                                if line.startswith('+') and not line.startswith('+++'):
-                                    color = _GREEN
-                                elif line.startswith('-') and not line.startswith('---'):
-                                    color = _RED
-                                elif line.startswith('@@') or line.startswith('---') \
-                                        or line.startswith('+++'):
-                                    color = _BRIGHT_BLUE
-                                else:
-                                    color = None
-                                print(f"              {clr(line, color) if color else line}")
-                elif failed_names:
-                    for tc_name, tc_status, detail in all_cases:
-                        if tc_status not in ('failed', 'error'):
-                            continue
-                        print(f"         FAILED: {tc_name}")
-                        if detail:
-                            for line in detail.splitlines():
-                                if line.startswith('+') and not line.startswith('+++'):
-                                    color = _GREEN
-                                elif line.startswith('-') and not line.startswith('---'):
-                                    color = _RED
-                                elif line.startswith('@@') or line.startswith('---') \
-                                        or line.startswith('+++'):
-                                    color = _BRIGHT_BLUE
-                                else:
-                                    color = None
-                                print(f"                {clr(line, color) if color else line}")
-            elif cpplint_result:
-                n_total, n_passed_cp, n_failed_cp, error_lines = cpplint_result
-                print(f"  {tag} {name:<{name_w}}{label_str:<{label_w}}  "
-                      f"{counts_str}{padding}{time_str}")
-                if n_failed_cp:
-                    for err_line in error_lines:
-                        print(f"         {clr(err_line, _RED)}")
-            else:
-                print(f"  {tag} {name:<{name_w}}{label_str:<{label_w}}  "
-                      f"{counts_str}{padding}{time_str}")
+            _print_suite_entry(name, label, exec_time, xunit, suite_ok, cpplint_result,
+                               name_w, label_w, counts_str, padding, verbose)
 
         print()
 
     print(sep)
     suite_str = f"{total_suites_passed}/{total_suites} suites"
     summary_status = clr("FAILED", _BOLD_RED) if any_failure else clr("passed", _GREEN)
-    elapsed_str = f" ({clr(_fmt_duration(elapsed), _BRIGHT_BLUE)})" if elapsed is not None else ""
+    elapsed_str = (f" ({clr(_fmt_duration(elapsed), _BRIGHT_BLUE)})"
+                   if elapsed is not None else "")
     if total_tests > 0:
         test_parts = [clr(f"{total_passed} passed", _GREEN)]
         if total_skipped:
@@ -375,7 +403,7 @@ def _list_packages(workspace, packages, no_deps):
         cmd += ["--packages-select" if no_deps else "--packages-up-to"] + packages
     try:
         result = subprocess.run(cmd, cwd=workspace, capture_output=True, text=True)
-        names = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+        names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         return names if names else None
     except Exception:
         return None
@@ -399,7 +427,6 @@ def test_command(args):
         print(f"Error: Workspace has not been initialized. Run 'hatch init' first.")
         sys.exit(1)
 
-    import yaml
     config_content = {
         "build_space": "build",
         "colcon_build_args": [],
@@ -410,8 +437,9 @@ def test_command(args):
     }
     with open(config_file, "r") as f:
         config_content.update(yaml.safe_load(f))
+    # The `or` guards below handle keys explicitly set to null/empty in the YAML.
 
-    build_space = config_content.get("build_space", "build") or "build"
+    build_space = config_content.get("build_space") or "build"
 
     if args.results_only:
         packages = args.pkgs
@@ -430,13 +458,13 @@ def test_command(args):
     colcon_cmd = ["colcon", "test"]
     colcon_cmd += ['--build-base', build_space]
 
-    test_result_space = config_content.get("test_result_space", "test_results") or "test_results"
+    test_result_space = config_content.get("test_result_space") or "test_results"
     colcon_cmd += ['--test-result-base', test_result_space]
 
     if args.colcon_build_args:
         colcon_cmd += args.colcon_build_args
 
-    nice = config_content.get("nice", 0) or 0
+    nice = config_content.get("nice") or 0
 
     packages = args.pkgs
     if args.this:
@@ -486,7 +514,8 @@ def test_command(args):
             stderr=subprocess.STDOUT,
             env=env,
         )
-        test_returncode = run_test_with_status(process, workspace, nice, total=total, pkg_names=pkg_names)
+        test_returncode = run_test_with_status(
+            process, workspace, nice, total=total, pkg_names=pkg_names)
     else:
         process = subprocess.Popen(
             colcon_shell_cmd,
