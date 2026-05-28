@@ -1,4 +1,5 @@
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -47,6 +48,8 @@ def get_xunit_path_from_cmdline(cmdline):
                 return tokens[i + 1]
             if token.startswith('--gtest_output=xml:'):
                 return token[len('--gtest_output=xml:'):]
+            if token == '--xunit-file' and i + 1 < len(tokens):
+                return tokens[i + 1]
     except Exception:
         pass
     return None
@@ -80,7 +83,7 @@ def parse_xunit_results(xunit_path):
                 if fail_el is not None:
                     status = 'failed'
                     failed_names.append(tc_name)
-                    detail = fail_el.get('message') or (fail_el.text or '').strip()
+                    detail = (fail_el.text or '').strip() or fail_el.get('message', '')
                 elif err_el is not None:
                     status = 'error'
                     failed_names.append(tc_name)
@@ -95,6 +98,31 @@ def parse_xunit_results(xunit_path):
         return total, passed, skipped, failures, errors, failed_names, all_cases
     except Exception:
         return None
+
+
+def parse_cpplint_output(output):
+    """Parse cpplint output into (total, n_passed, n_failed, error_lines), or None.
+
+    cpplint prints 'Done processing <file>' for every file it completes and error
+    lines as 'file:line:  message  [category] [N]'. Failures are counted only for
+    files that appear in both lists; files with errors but no 'Done processing' line
+    (e.g. third-party headers that caused a processing exception) are included in
+    error_lines for display but not counted against the total.
+    """
+    processed = []
+    per_file_errors = {}
+    for line in output.splitlines():
+        if line.startswith('Done processing '):
+            processed.append(line[len('Done processing '):])
+        else:
+            m = re.match(r'^(.+?):\d+:', line)
+            if m and '[' in line and ']' in line:
+                per_file_errors.setdefault(m.group(1), []).append(line)
+    if not processed:
+        return None
+    n_failed = sum(1 for f in processed if f in per_file_errors)
+    all_error_lines = [line for errors in per_file_errors.values() for line in errors]
+    return len(processed), len(processed) - n_failed, n_failed, all_error_lines
 
 
 def get_latest_ctest_xml(pkg_build_dir):
@@ -190,13 +218,26 @@ def print_test_results(workspace, build_space, verbose=False, packages=None, ela
                 pkg_failed_tests += n_failures + n_errors
                 if n_failures or n_errors:
                     suite_ok = False
+                if not label and '--gtest_output' in entry.findtext('FullCommandLine', ''):
+                    label = 'gtest'
 
             if suite_ok:
                 pkg_suites_passed += 1
             else:
                 pkg_failed = True
 
-            suite_data.append((name, label, exec_time, xunit, suite_ok))
+            cpplint_result = None
+            if not xunit and 'cpplint' in entry.findtext('FullCommandLine', '').lower():
+                if not label:
+                    label = 'cpplint'
+                cpplint_result = parse_cpplint_output(entry.findtext('.//Measurement/Value', ''))
+                if cpplint_result:
+                    n_total, n_passed_cp, n_failed_cp, _error_lines = cpplint_result
+                    pkg_tests += n_total
+                    pkg_passed += n_passed_cp
+                    pkg_failed_tests += n_failed_cp
+
+            suite_data.append((name, label, exec_time, xunit, suite_ok, cpplint_result))
 
         if pkg_failed:
             any_failure = True
@@ -222,7 +263,7 @@ def print_test_results(workspace, build_space, verbose=False, packages=None, ela
         label_w = max((len(f" [{s[1]}]") if s[1] else 0) for s in suite_data)
 
         suite_counts = []
-        for name, label, exec_time, xunit, suite_ok in suite_data:
+        for name, label, exec_time, xunit, suite_ok, cpplint_result in suite_data:
             if xunit:
                 n_total, n_passed, n_skipped, n_failures, n_errors, failed_names, all_cases = xunit
                 counts = []
@@ -235,6 +276,14 @@ def print_test_results(workspace, build_space, verbose=False, packages=None, ela
                 if n_errors:
                     counts.append(clr(f"{n_errors} errors", _BOLD_RED))
                 counts_str = ", ".join(counts) if counts else "0 tests"
+            elif cpplint_result:
+                n_total, n_passed_cp, n_failed_cp, _error_lines = cpplint_result
+                counts = []
+                if n_passed_cp:
+                    counts.append(clr(f"{n_passed_cp} passed", _GREEN))
+                if n_failed_cp:
+                    counts.append(clr(f"{n_failed_cp} failed", _BOLD_RED))
+                counts_str = ", ".join(counts) if counts else "0 files"
             else:
                 counts_str = clr("passed", _GREEN) if suite_ok else clr("FAILED", _BOLD_RED)
             counts_vis = len(_strip_ansi(counts_str))
@@ -242,8 +291,8 @@ def print_test_results(workspace, build_space, verbose=False, packages=None, ela
 
         counts_w = max(cv for _, _, cv in suite_counts)
 
-        for (name, label, exec_time, xunit, suite_ok), (xunit2, counts_str, counts_vis) in \
-                zip(suite_data, suite_counts):
+        for (name, label, exec_time, xunit, suite_ok, cpplint_result), \
+                (xunit2, counts_str, counts_vis) in zip(suite_data, suite_counts):
             tag = clr("[ ok ]", _GREEN) if suite_ok else clr("[FAIL]", _BOLD_RED)
             label_str = f" [{label}]" if label else ""
             time_str = f"  ({clr(f'{exec_time:.2f}s', _BRIGHT_BLUE)})" if exec_time is not None else ""
@@ -261,7 +310,16 @@ def print_test_results(workspace, build_space, verbose=False, packages=None, ela
                         print(f"       {tc_tag} {tc_name}")
                         if detail and tc_status in ('failed', 'error'):
                             for line in detail.splitlines():
-                                print(f"              {clr(line, _RED)}")
+                                if line.startswith('+') and not line.startswith('+++'):
+                                    color = _GREEN
+                                elif line.startswith('-') and not line.startswith('---'):
+                                    color = _RED
+                                elif line.startswith('@@') or line.startswith('---') \
+                                        or line.startswith('+++'):
+                                    color = _BRIGHT_BLUE
+                                else:
+                                    color = None
+                                print(f"              {clr(line, color) if color else line}")
                 elif failed_names:
                     for tc_name, tc_status, detail in all_cases:
                         if tc_status not in ('failed', 'error'):
@@ -269,7 +327,23 @@ def print_test_results(workspace, build_space, verbose=False, packages=None, ela
                         print(f"         FAILED: {tc_name}")
                         if detail:
                             for line in detail.splitlines():
-                                print(f"                {clr(line, _RED)}")
+                                if line.startswith('+') and not line.startswith('+++'):
+                                    color = _GREEN
+                                elif line.startswith('-') and not line.startswith('---'):
+                                    color = _RED
+                                elif line.startswith('@@') or line.startswith('---') \
+                                        or line.startswith('+++'):
+                                    color = _BRIGHT_BLUE
+                                else:
+                                    color = None
+                                print(f"                {clr(line, color) if color else line}")
+            elif cpplint_result:
+                n_total, n_passed_cp, n_failed_cp, error_lines = cpplint_result
+                print(f"  {tag} {name:<{name_w}}{label_str:<{label_w}}  "
+                      f"{counts_str}{padding}{time_str}")
+                if n_failed_cp:
+                    for err_line in error_lines:
+                        print(f"         {clr(err_line, _RED)}")
             else:
                 print(f"  {tag} {name:<{name_w}}{label_str:<{label_w}}  "
                       f"{counts_str}{padding}{time_str}")
