@@ -107,7 +107,6 @@ def delete_matching_dirs(root_dir, names_to_delete):
         if subdir.is_dir() and subdir.name in names_to_delete:
             shutil.rmtree(subdir)
 
-
 def get_dependent_packages(packages):
     cmd = ["colcon", "list", "-n", "--packages-above"] + packages
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -275,6 +274,23 @@ def parse_cmake_settings(colcon_build_args):
         'compile_commands': compile_commands,
     }
 
+def check_colcon_event_handlers(workspace, extend_prefix, handlers):
+    """Test if colcon accepts the given event handler flags in the subprocess shell environment."""
+    handler_args = " ".join(handlers)
+    cmd = f"{extend_prefix}colcon build --event-handlers {handler_args} --help"
+    try:
+        res = subprocess.run(
+            cmd,
+            cwd=workspace,
+            shell=True,
+            executable="/bin/bash",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
 
 def print_workspace_state(workspace):
     src_dir = os.path.join(workspace, "src")

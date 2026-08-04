@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from .common import (get_workspace_dir, get_package,
+from .common import (check_colcon_event_handlers, get_workspace_dir, get_package,
                      clr, supports_ansi, _fmt_duration, _strip_ansi,
                      _GREEN, _YELLOW, _RED, _BOLD_RED,
                      _BRIGHT_BLUE, _BRIGHT_MAGENTA, _DIM)
@@ -439,6 +439,15 @@ def test_command(args):
         config_content.update(yaml.safe_load(f))
     # The `or` guards below handle keys explicitly set to null/empty in the YAML.
 
+    extend_path = config_content.get("extend_path", None)
+    extend_prefix = ""
+    if extend_path:
+        extend_script = os.path.join(extend_path, "setup.bash")
+        if not os.path.exists(extend_script):
+            print(f"Error: '{extend_script}' does not exist.")
+            sys.exit(1)
+        extend_prefix = f"source {extend_script} && "
+
     build_space = config_content.get("build_space") or "build"
 
     if args.results_only:
@@ -481,17 +490,12 @@ def test_command(args):
     use_status_display = supports_ansi()
 
     if use_status_display:
-        colcon_cmd += ['--event-handlers', 'status-', 'parallel_status-']
+        if check_colcon_event_handlers(workspace, extend_prefix, ['status-', 'parallel_status-']):
+            colcon_cmd += ['--event-handlers', 'status-', 'parallel_status-']
+        elif check_colcon_event_handlers(workspace, extend_prefix, ['status-']):
+            colcon_cmd += ['--event-handlers', 'status-']
 
-    colcon_shell_cmd = ' '.join(colcon_cmd)
-
-    extend_path = config_content.get("extend_path", None)
-    if extend_path:
-        extend_script = os.path.join(extend_path, "setup.bash")
-        if not os.path.exists(extend_script):
-            print(f"Error: '{extend_script}' does not exist.")
-            sys.exit(1)
-        colcon_shell_cmd = f'source {extend_script} && ' + colcon_shell_cmd
+    colcon_shell_cmd = extend_prefix + ' '.join(colcon_cmd)
 
     print(clr(f"Running: {colcon_shell_cmd}", _DIM))
 

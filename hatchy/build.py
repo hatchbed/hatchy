@@ -3,7 +3,8 @@ import subprocess
 import sys
 import time
 
-from .common import get_workspace_dir, get_package, clr, supports_ansi, _DIM
+from .common import (check_colcon_event_handlers, get_workspace_dir, get_package, clr,
+                     supports_ansi, _DIM)
 
 
 def register(subparsers):
@@ -43,7 +44,6 @@ def _list_packages(workspace, packages, no_deps):
     except Exception:
         return None
 
-
 def build_command(args):
     workspace = os.path.abspath(args.workspace)
 
@@ -73,6 +73,15 @@ def build_command(args):
     }
     with open(config_file, "r") as f:
         config_content.update(yaml.safe_load(f))
+
+    extend_path = config_content.get("extend_path", None)
+    extend_prefix = ""
+    if extend_path:
+        extend_script = os.path.join(extend_path, "setup.bash")
+        if not os.path.exists(extend_script):
+            print(f"Error: '{extend_script}' does not exist.")
+            sys.exit(1)
+        extend_prefix = f"source {extend_script} && "
 
     colcon_cmd = ["colcon", "build"]
 
@@ -110,17 +119,12 @@ def build_command(args):
     use_status_display = supports_ansi()
 
     if use_status_display:
-        colcon_cmd += ['--event-handlers', 'status-', 'parallel_status-']
+        if check_colcon_event_handlers(workspace, extend_prefix, ['status-', 'parallel_status-']):
+            colcon_cmd += ['--event-handlers', 'status-', 'parallel_status-']
+        elif check_colcon_event_handlers(workspace, extend_prefix, ['status-']):
+            colcon_cmd += ['--event-handlers', 'status-']
 
-    colcon_shell_cmd = ' '.join(colcon_cmd)
-
-    extend_path = config_content.get("extend_path", None)
-    if extend_path:
-        extend_script = os.path.join(extend_path, "setup.bash")
-        if not os.path.exists(extend_script):
-            print(f"Error: '{extend_script}' does not exist.")
-            sys.exit(1)
-        colcon_shell_cmd = f'source {extend_script} && ' + colcon_shell_cmd
+    colcon_shell_cmd = extend_prefix + ' '.join(colcon_cmd)
 
     print(clr(f"Running: {colcon_shell_cmd}", _DIM))
 
