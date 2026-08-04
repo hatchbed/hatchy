@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.3]
+
+### Fixed
+- Check that colcon event handlers actually exist before using them.
+
 ## [0.5.2]
 
 ### Fixed
