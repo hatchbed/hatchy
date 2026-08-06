@@ -35,6 +35,10 @@ def register(subparsers):
         "--colcon-build-args", metavar='ARG', dest='colcon_build_args',
         nargs="+", required=False, type=str, default=None,
         help="Additional arguments for colcon")
+    config_group.add_argument(
+        "--nice", "-n", type=int, help="Override config CPU niceness.")
+    config_group.add_argument(
+        "--cpus", "-c", type=int, help="Override config max CPU budget.")
     config_group.add_argument("--verbose", "-v", action="store_true",
                               help="Show the status of every individual test case.")
     config_group.add_argument("--results-only", "-r", action="store_true",
@@ -474,6 +478,13 @@ def test_command(args):
         colcon_cmd += args.colcon_build_args
 
     nice = config_content.get("nice") or 0
+    if args.nice is not None:
+        nice = args.nice
+
+    cpus = config_content.get("cpus", os.cpu_count()) or os.cpu_count()
+    if args.cpus is not None:
+        cpus = args.cpus
+    cpus = min(max(1, cpus), os.cpu_count())
 
     packages = args.pkgs
     if args.this:
@@ -494,6 +505,10 @@ def test_command(args):
             colcon_cmd += ['--event-handlers', 'status-', 'parallel_status-']
         elif check_colcon_event_handlers(workspace, extend_prefix, ['status-']):
             colcon_cmd += ['--event-handlers', 'status-']
+
+    if cpus < os.cpu_count():
+        target_cpus = set(range(cpus))
+        os.sched_setaffinity(0, target_cpus)
 
     colcon_shell_cmd = extend_prefix + ' '.join(colcon_cmd)
 

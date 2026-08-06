@@ -28,7 +28,9 @@ def register(subparsers):
         nargs="+", required=False, type=str, default=None,
         help="Additional arguments for colcon")
     config_group.add_argument(
-        "--nice", "-n", type=int, help="CPU niceness for build commands. (default: 0)")
+        "--nice", "-n", type=int, help="Override config CPU niceness.")
+    config_group.add_argument(
+        "--cpus", "-c", type=int, help="Override config max CPU budget.")
     parser.set_defaults(func=build_command)
 
 
@@ -102,6 +104,11 @@ def build_command(args):
     if args.nice is not None:
         nice = args.nice
 
+    cpus = config_content.get("cpus", os.cpu_count()) or os.cpu_count()
+    if args.cpus is not None:
+        cpus = args.cpus
+    cpus = min(max(1, cpus), os.cpu_count())
+
     colcon_cmd += colcon_build_args
 
     packages = args.pkgs
@@ -123,6 +130,10 @@ def build_command(args):
             colcon_cmd += ['--event-handlers', 'status-', 'parallel_status-']
         elif check_colcon_event_handlers(workspace, extend_prefix, ['status-']):
             colcon_cmd += ['--event-handlers', 'status-']
+
+    if cpus < os.cpu_count():
+        target_cpus = set(range(cpus))
+        os.sched_setaffinity(0, target_cpus)
 
     colcon_shell_cmd = extend_prefix + ' '.join(colcon_cmd)
 

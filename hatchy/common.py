@@ -301,7 +301,8 @@ def print_workspace_state(workspace):
     build_space = "build"
     install_space = "install"
     test_result_space = "test_results"
-    nice = 0
+    nice = None
+    cpus = None
 
     if os.path.exists(config_file):
         with open(config_file, "r") as f:
@@ -313,7 +314,10 @@ def print_workspace_state(workspace):
             build_space = config.get("build_space", "build") or "build"
             install_space = config.get("install_space", "install") or "install"
             test_result_space = config.get("test_result_space", "test_results") or "test_results"
-            nice = config.get("nice", 0) or 0
+            nice = config.get("nice")
+            if nice is not None:
+                nice = str(nice)
+            cpus = config.get("cpus")
 
     build_dir = os.path.join(workspace, build_space)
     install_dir = os.path.join(workspace, install_space)
@@ -361,7 +365,7 @@ def print_workspace_state(workspace):
     print(f"{_key_pad('Source Space:', key_w)}{_space_status(src_dir, missing_color=_RED)}")
     cmake = parse_cmake_settings(colcon_build_args)
 
-    def _cmake_status(val, default=''):
+    def _status(val, default=''):
         if val is None:
             tag = '[default]'
             gap = ' ' * (_STATUS_TAG_W - len(tag))
@@ -381,7 +385,12 @@ def print_workspace_state(workspace):
         return f"{clr(label, color)}{gap}{val}"
 
     print(sep)
-    print(f"{_key_pad('CPU Niceness:', value_col)}{nice}")
+    print(f"{_key_pad('CPU Niceness:', key_w)}{_status(nice, '0')}")
+    default_budget = f"{os.cpu_count()} of {os.cpu_count()}"
+    cpu_budget = None
+    if cpus:
+        cpu_budget = f"{cpus} of {os.cpu_count()}"
+    print(f"{_key_pad('CPU Budget:', key_w)}{_status(cpu_budget, default_budget)}")
     if not colcon_build_args:
         print(f"{_key_pad('Colcon Build Args:', value_col)}None")
     else:
@@ -389,10 +398,10 @@ def print_workspace_state(workspace):
         for arg in colcon_build_args[1:]:
             print(f"{' ' * value_col}{arg}")
     print(f"{_key_pad('Generator:', key_w)}{_tool_status(cmake['generator'], 'generator')}")
-    print(f"{_key_pad('Build Type:', key_w)}{_cmake_status(cmake['build_type'])}")
+    print(f"{_key_pad('Build Type:', key_w)}{_status(cmake['build_type'])}")
     print(f"{_key_pad('Compiler:', key_w)}{_tool_status(cmake['compiler'], 'compiler')}")
     print(f"{_key_pad('Linker:', key_w)}{_tool_status(cmake['linker'], 'linker')}")
     print(f"{_key_pad('Compiler Cache:', key_w)}{_tool_status(cmake['ccache'], 'ccache')}")
-    print(f"{_key_pad('Build Testing:', key_w)}{_cmake_status(cmake['build_testing'], 'on')}")
-    print(f"{_key_pad('Compile Commands:', key_w)}{_cmake_status(cmake['compile_commands'], 'off')}")
+    print(f"{_key_pad('Build Testing:', key_w)}{_status(cmake['build_testing'], 'on')}")
+    print(f"{_key_pad('Compile Commands:', key_w)}{_status(cmake['compile_commands'], 'off')}")
     print(sep)

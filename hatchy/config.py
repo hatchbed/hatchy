@@ -238,8 +238,10 @@ def register(subparsers):
         type=_ci_choice(BOOL_OPTIONS),
         help=f"Export compile commands (-DCMAKE_EXPORT_COMPILE_COMMANDS): {', '.join(BOOL_OPTIONS)}. "
              "'Default' removes the flag from colcon build args.")
-    build_group.add_argument("--nice", "-n", type=int,
-                             help="CPU niceness for build commands. (default: 0)")
+    build_group.add_argument(
+        "--nice", "-n", type=int, help="CPU niceness for build commands. (default: 0)")
+    build_group.add_argument(
+        "--cpus", "-c", type=int, help="Max CPU budget.")
     parser.set_defaults(func=config_command)
 
 
@@ -264,7 +266,6 @@ def config_command(args):
     config_content = {
         "build_space": "build",
         "colcon_build_args": [],
-        "nice": 0,
         "extend_path": "",
         "install_space": "install",
         "test_result_space": "test_results"
@@ -354,6 +355,9 @@ def config_command(args):
 
     if args.nice:
         config_content['nice'] = args.nice
+
+    if args.cpus:
+        config_content['cpus'] = args.cpus
 
     with open(config_file, "w") as f:
         yaml.dump(config_content, f, default_flow_style=False)
