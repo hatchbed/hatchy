@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.4]
+
+### Added
+- --cpus argument to build and test commands.
+
 ## [0.5.3]
 
 ### Fixed
